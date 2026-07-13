@@ -6,23 +6,19 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
-public class DynamicApiSettings
-{
-    public string? BaseUrl { get; set; }
-    public string? ApiKey { get; set; }
-}
-
 public class DynamicActionClient : IDynamicActionClient
 {
     private readonly IHttpClientFactory _httpFactory;
     private readonly DynamicApiSettings _settings;
     private readonly ILogger<DynamicActionClient> _logger;
+    private readonly ITokenProvider _tokenProvider;
 
-    public DynamicActionClient(IHttpClientFactory httpFactory, IOptions<DynamicApiSettings> options, ILogger<DynamicActionClient> logger)
+    public DynamicActionClient(IHttpClientFactory httpFactory, IOptions<DynamicApiSettings> options, ILogger<DynamicActionClient> logger, ITokenProvider tokenProvider)
     {
         _httpFactory = httpFactory;
         _settings = options.Value;
         _logger = logger;
+        _tokenProvider = tokenProvider;
     }
 
     public async Task<bool> InvokeActionAsync(string actionName, string jsonPayload, CancellationToken ct)
@@ -38,8 +34,21 @@ public class DynamicActionClient : IDynamicActionClient
 
         using var content = new StringContent(jsonPayload ?? string.Empty, Encoding.UTF8, "application/json");
 
-        if (!string.IsNullOrEmpty(_settings.ApiKey))
+        // If OAuth configured, get token and set Authorization header
+        if (_settings.UseOAuth)
+        {
+            var token = await _tokenProvider.GetTokenAsync(ct);
+            if (string.IsNullOrEmpty(token))
+            {
+                _logger.LogWarning("Could not obtain access token, aborting dynamic action call.");
+                return false;
+            }
+            client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        }
+        else if (!string.IsNullOrEmpty(_settings.ApiKey))
+        {
             client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {_settings.ApiKey}");
+        }
 
         try
         {

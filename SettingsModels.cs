@@ -15,3 +15,9 @@ public class ForwardingSettings
     public string? DefaultEndpoint { get; set; }
     public Dictionary<string, string>? Endpoints { get; set; }
 }
+
+public class DynamicApiSettings
+{
+    public string? BaseUrl { get; set; }
+    public string? ApiKey { get; set; }
+}

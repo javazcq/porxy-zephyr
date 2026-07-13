@@ -17,17 +17,20 @@ public class MessageForwarder : IMessageForwarder
     private readonly ForwardingSettings _settings;
     private readonly ILogger<MessageForwarder> _logger;
     private readonly AsyncRetryPolicy<HttpResponseMessage> _retryPolicy;
+    private readonly IDynamicActionClient _dynamicClient;
 
     public MessageForwarder(
         IHttpClientFactory httpFactory,
         IEndpointResolver resolver,
         IOptions<ForwardingSettings> settings,
+        IDynamicActionClient dynamicClient,
         ILogger<MessageForwarder> logger)
     {
         _httpFactory = httpFactory;
         _resolver = resolver;
         _settings = settings.Value;
         _logger = logger;
+        _dynamicClient = dynamicClient;
 
         _retryPolicy = Policy<HttpResponseMessage>
             .Handle<HttpRequestException>()
@@ -63,6 +66,22 @@ public class MessageForwarder : IMessageForwarder
         {
             _logger.LogInformation("No endpoint resolved for message at {TPO}; skipping", consumeResult.TopicPartitionOffset);
             return false;
+        }
+
+        // If endpoint begins with dynamic:, delegate to DynamicActionClient
+        if (endpoint.StartsWith("dynamic:", StringComparison.OrdinalIgnoreCase))
+        {
+            var actionName = endpoint.Substring("dynamic:".Length);
+            try
+            {
+                var success = await _dynamicClient.InvokeActionAsync(actionName, consumeResult.Message.Value ?? string.Empty, ct);
+                return success;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Exception while invoking dynamic action {Action} for message {TPO}", actionName, consumeResult.TopicPartitionOffset);
+                return false;
+            }
         }
 
         var client = _httpFactory.CreateClient("forwarder");

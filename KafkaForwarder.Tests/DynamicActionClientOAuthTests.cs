@@ -10,7 +10,7 @@ using Confluent.Kafka;
 public class DynamicActionClientOAuthTests
 {
     [Fact]
-    public async Task InvokeActionAsync_UsesOAuth2_ClientCredentials()
+    public async Task InvokeActionAsync_UsesOAuth2_ClientCredentials_WithBasicAuth()
     {
         // Arrange
         var oauthJson = "{\"access_token\":\"tkn123\",\"expires_in\":3600}";
@@ -51,8 +51,13 @@ public class DynamicActionClientOAuthTests
         Assert.Equal("application/x-www-form-urlencoded", tokenReq.Content.Headers.ContentType!.MediaType);
         var tokenBody = await tokenReq.Content.ReadAsStringAsync();
         Assert.Contains("grant_type=client_credentials", tokenBody);
-        Assert.Contains("client_id=cid", tokenBody);
-        Assert.Contains("client_secret=secret", tokenBody);
+        // body should NOT contain client_id or client_secret when using Basic auth
+        Assert.DoesNotContain("client_id=", tokenBody);
+        Assert.DoesNotContain("client_secret=", tokenBody);
+
+        // Authorization header should be Basic base64(cid:secret)
+        var expected = "Basic " + System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("cid:secret"));
+        Assert.Equal(expected, tokenReq.Headers.Authorization?.ToString());
 
         var actionReq = handler.Requests[1];
         Assert.Equal("http://api.dynamic.local/actions/order", actionReq.RequestUri.ToString());

@@ -45,22 +45,23 @@ public class OAuthTokenProvider : ITokenProvider
             }
 
             var client = _httpFactory.CreateClient("dynamic");
+
+            // Use HTTP Basic auth for token endpoint as required: Authorization: Basic base64(clientId:clientSecret)
+            var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_settings.ClientId}:{_settings.ClientSecret}"));
+            var req = new HttpRequestMessage(HttpMethod.Post, _settings.TokenUrl);
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", basic);
+
+            // Body: only grant_type and optional scope (no client_id/client_secret in body)
             var body = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string,string>>
             {
-                new System.Collections.Generic.KeyValuePair<string,string>("grant_type","client_credentials"),
-                new System.Collections.Generic.KeyValuePair<string,string>("client_id", _settings.ClientId),
-                new System.Collections.Generic.KeyValuePair<string,string>("client_secret", _settings.ClientSecret)
+                new System.Collections.Generic.KeyValuePair<string,string>("grant_type","client_credentials")
             };
-
             if (!string.IsNullOrEmpty(_settings.Scope))
             {
                 body.Add(new System.Collections.Generic.KeyValuePair<string,string>("scope", _settings.Scope));
             }
 
-            var req = new HttpRequestMessage(HttpMethod.Post, _settings.TokenUrl)
-            {
-                Content = new FormUrlEncodedContent(body)
-            };
+            req.Content = new FormUrlEncodedContent(body);
 
             var resp = await client.SendAsync(req, ct);
             if (!resp.IsSuccessStatusCode)

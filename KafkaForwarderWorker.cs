@@ -20,8 +20,9 @@ public class KafkaForwarderWorker : BackgroundService
     private readonly KafkaSettings _kafkaSettings;
     private readonly ForwardingSettings _forwardingSettings;
     private readonly SemaphoreSlim _semaphore;
-    private readonly AsyncRetryPolicy<HttpResponseMessage> _httpRetryPolicy;
+    private readonly IMessageForwarder _messageForwarder;
 
+    // Track highest processed offset per partition (next offset to commit)
     private readonly ConcurrentDictionary<TopicPartition, Offset> _processedOffsets = new();
 
     public KafkaForwarderWorker(
@@ -29,7 +30,8 @@ public class KafkaForwarderWorker : BackgroundService
         IHttpClientFactory httpFactory,
         IEndpointResolver resolver,
         IOptions<KafkaSettings> kafkaOptions,
-        IOptions<ForwardingSettings> forwardingOptions)
+        IOptions<ForwardingSettings> forwardingOptions,
+        IMessageForwarder messageForwarder)
     {
         _logger = logger;
         _httpFactory = httpFactory;
@@ -37,18 +39,7 @@ public class KafkaForwarderWorker : BackgroundService
         _kafkaSettings = kafkaOptions.Value;
         _forwardingSettings = forwardingOptions.Value;
         _semaphore = new SemaphoreSlim(_forwardingSettings.MaxConcurrency);
-
-        _httpRetryPolicy = Policy<HttpResponseMessage>
-            .Handle<HttpRequestException>()
-            .OrResult(r => !r.IsSuccessStatusCode)
-            .WaitAndRetryAsync(
-                _forwardingSettings.RetryCount,
-                attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)) * _forwardingSettings.RetryBaseSeconds,
-                onRetry: (outcome, timespan, retryAttempt, context) =>
-                {
-                    _logger.LogWarning("HTTP forward retry {Attempt} after {Delay}. Reason: {Reason}",
-                        retryAttempt, timespan, outcome.Exception?.Message ?? outcome.Result.StatusCode.ToString());
-                });
+        _messageForwarder = messageForwarder;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -57,7 +48,7 @@ public class KafkaForwarderWorker : BackgroundService
         {
             BootstrapServers = _kafkaSettings.BootstrapServers,
             GroupId = _kafkaSettings.GroupId,
-            EnableAutoCommit = false,
+            EnableAutoCommit = false, // manual commit after processing
             AutoOffsetReset = AutoOffsetReset.Earliest,
             AllowAutoCreateTopics = false
         };
@@ -91,13 +82,16 @@ public class KafkaForwarderWorker : BackgroundService
 
                 if (consumeResult == null) continue;
 
+                // Wait for concurrency slot
                 await _semaphore.WaitAsync(stoppingToken);
 
+                // Launch background processing task
                 _ = Task.Run(async () =>
                 {
                     try
                     {
-                        await ProcessMessageAsync(consumeResult, stoppingToken);
+                        var success = await _messageForwarder.ForwardAsync(consumeResult, stoppingToken);
+                        // mark offset as processed (next offset to commit) regardless of success here; configurable
                         var tpo = consumeResult.TopicPartition;
                         var nextOffset = consumeResult.Offset + 1;
                         _processedOffsets.AddOrUpdate(tpo, nextOffset, (_, existing) => existing <= nextOffset ? nextOffset : existing);
@@ -115,42 +109,16 @@ public class KafkaForwarderWorker : BackgroundService
                     }
                 }, stoppingToken);
 
+                // Commit any processed offsets (do it from the consumer thread)
                 await CommitProcessedOffsetsAsync(consumer);
             }
         }
         finally
         {
+            // final commit before shutdown
             await CommitProcessedOffsetsAsync(consumer);
             consumer.Close();
             _logger.LogInformation("Consumer closed.");
-        }
-    }
-
-    private async Task ProcessMessageAsync(ConsumeResult<string, string> cr, CancellationToken ct)
-    {
-        _logger.LogInformation("Processing message at {TPO}", cr.TopicPartitionOffset);
-
-        using var doc = JsonDocument.Parse(cr.Message.Value ?? "{}");
-        var endpoint = _resolver.Resolve(doc.RootElement);
-
-        if (string.IsNullOrEmpty(endpoint))
-        {
-            _logger.LogWarning("No endpoint resolved for message at {TPO}; skipping", cr.TopicPartitionOffset);
-            return;
-        }
-
-        var client = _httpFactory.CreateClient("forwarder");
-        var content = new StringContent(cr.Message.Value ?? "", System.Text.Encoding.UTF8, "application/json");
-        HttpResponseMessage response = await _httpRetryPolicy.ExecuteAsync(async ctInner =>
-            await client.PostAsync(endpoint, content, ctInner), ct);
-
-        if (response.IsSuccessStatusCode)
-        {
-            _logger.LogInformation("Forwarded message {TPO} -> {Endpoint} (Status {Status})", cr.TopicPartitionOffset, endpoint, response.StatusCode);
-        }
-        else
-        {
-            _logger.LogWarning("Failed to forward message {TPO} -> {Endpoint} after retries. Status: {Status}", cr.TopicPartitionOffset, endpoint, response.StatusCode);
         }
     }
 
@@ -168,6 +136,7 @@ public class KafkaForwarderWorker : BackgroundService
         {
             consumer.Commit(offsetsToCommit);
             _logger.LogInformation("Committed {Count} partition offsets", offsetsToCommit.Count);
+            // remove committed entries
             foreach (var tpo in offsetsToCommit)
             {
                 _processedOffsets.TryRemove(tpo.TopicPartition, out _);
@@ -176,6 +145,7 @@ public class KafkaForwarderWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to commit offsets");
+            // keep entries for next attempt
         }
 
         return Task.CompletedTask;

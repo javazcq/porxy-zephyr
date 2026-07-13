@@ -124,6 +124,7 @@ public class KafkaForwarderWorker : BackgroundService
 
     private Task CommitProcessedOffsetsAsync(IConsumer<string, string> consumer)
     {
+        // If there are no processed offsets, nothing to do
         if (_processedOffsets.IsEmpty) return Task.CompletedTask;
 
         var offsetsToCommit = new List<TopicPartitionOffset>();
@@ -136,6 +137,7 @@ public class KafkaForwarderWorker : BackgroundService
         {
             consumer.Commit(offsetsToCommit);
             _logger.LogInformation("Committed {Count} partition offsets", offsetsToCommit.Count);
+
             // remove committed entries
             foreach (var tpo in offsetsToCommit)
             {
